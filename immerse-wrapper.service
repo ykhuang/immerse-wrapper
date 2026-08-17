@@ -1,0 +1,27 @@
+[Unit]
+Description=ImmerseWrapper local translation adapter
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/immerse-wrapper
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=%h/.venvs/immerse-wrapper/bin/immerse-wrapper check-config --env-file %h/.config/immerse-wrapper/immerse-wrapper.env
+ExecStart=%h/.venvs/immerse-wrapper/bin/immerse-wrapper serve --env-file %h/.config/immerse-wrapper/immerse-wrapper.env
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=150
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
