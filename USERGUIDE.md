@@ -106,8 +106,8 @@ BACKEND_MODE=cli
 DEFAULT_BACKEND=antigravity
 ENABLE_ANTIGRAVITY=true
 ANTIGRAVITY_COMMAND=agy
-ANTIGRAVITY_MODEL=gemini-3.5-flash-low
-ANTIGRAVITY_REASONING_EFFORT=
+ANTIGRAVITY_MODEL=gemini-3.6-flash
+ANTIGRAVITY_REASONING_EFFORT=low
 ENABLE_CODEX=false
 ENABLE_LEGACY_GEMINI=false
 
@@ -133,24 +133,30 @@ OBSERVE_REQUEST_SHAPE=false
 YouTube 字幕較重視即時性時，可先把 `BATCH_WINDOW_MS` 改成 `60`；一般網頁建議先從
 `300` 開始。
 
-Agy 1.1.5 以上支援獨立的 reasoning effort；目前驗證版本為 1.1.13。原本的完整 model
-slug 已包含 effort，因此以下設定仍然有效，且不需要重複指定 effort：
+Agy 1.1.5 以上支援獨立的 reasoning effort。目前文件使用仍可用的最低 Gemini Flash
+系列 `gemini-3.6-flash`；建議把 model 與 effort 分開設定：
 
 ```dotenv
-ANTIGRAVITY_MODEL=gemini-3.5-flash-low
-ANTIGRAVITY_REASONING_EFFORT=
-```
-
-若希望像 Codex 一樣分開管理，可使用 base model 加上 `low`、`medium` 或 `high`：
-
-```dotenv
-ANTIGRAVITY_MODEL=gemini-3.5-flash
+ANTIGRAVITY_MODEL=gemini-3.6-flash
 ANTIGRAVITY_REASONING_EFFORT=low
 ```
 
-完整 model slug 與獨立 effort 同時設定時必須一致；例如 `gemini-3.5-flash-low` 搭配
+若帳號列出的完整 model slug 已包含 effort，也可以使用完整 slug 並把獨立設定留空：
+
+```dotenv
+ANTIGRAVITY_MODEL=gemini-3.6-flash-low
+ANTIGRAVITY_REASONING_EFFORT=
+```
+
+完整 model slug 與獨立 effort 同時設定時必須一致；例如 `gemini-3.6-flash-low` 搭配
 `high` 會在啟動設定驗證時失敗。可用 `agy models` 查詢可用模型，並以
 `agy --model <MODEL> -p '/effort'` 確認解析結果。
+
+目前 Agy 沒有名為 `app-server` 的模式或子命令。不過新版 CLI 的官方 headless protocol
+支援 `--input-format stream-json --output-format stream-json`，可維持單一程序並透過 stdin
+連續執行多個 turn，功能上接近 persistent transport。ImmerseWrapper 尚未串接這個 Agy
+transport，因此目前 Antigravity backend 仍是每次 backend call 啟動一次 CLI；下列
+Codex `app-server` 設定不適用於 Agy。
 
 ### Codex exec 基本設定
 
@@ -169,7 +175,7 @@ DEFAULT_BACKEND=codex
 ENABLE_ANTIGRAVITY=false
 ENABLE_CODEX=true
 CODEX_COMMAND=codex
-CODEX_MODEL=gpt-5.4-mini
+CODEX_MODEL=gpt-5.6-luna
 CODEX_REASONING_EFFORT=low
 CODEX_TRANSPORT=exec
 CODEX_SANDBOX=read-only
@@ -177,7 +183,7 @@ CODEX_EPHEMERAL=true
 MAX_CONCURRENCY=3
 ```
 
-模型與 reasoning effort 是不同參數；不要把 `gpt-5.4-mini-low` 當成模型名稱。
+模型與 reasoning effort 是不同參數；不要把 `gpt-5.6-luna-low` 當成模型名稱。
 
 若要使用 persistent app-server，改成：
 
@@ -200,9 +206,9 @@ CODEX_APP_SERVER_FALLBACK_TO_EXEC=true
 | `BACKEND_MODE` | 正式翻譯使用 `cli`；`mock` 只用於協定測試。 |
 | `MAX_CONCURRENCY` | 同時執行的 backend call 數。Agy/Codex exec 可先用 `3`；Codex app-server 必須為 `1`。 |
 | `REQUEST_TIMEOUT_SECONDS` | Adapter 等待 backend 的上限；目前預設 `120` 秒。這不能延長 Immersive Translate 自己的 timeout。 |
-| `ANTIGRAVITY_MODEL` | Agy 模型；留空表示使用 CLI/account 預設值。 |
+| `ANTIGRAVITY_MODEL` | Agy 模型；目前最低建議為 `gemini-3.6-flash`，留空表示使用 CLI/account 預設值。 |
 | `ANTIGRAVITY_REASONING_EFFORT` | 可選的 Agy reasoning effort：`low`、`medium` 或 `high`。完整 model slug 已含 effort 時可留空。 |
-| `CODEX_MODEL` | Codex 模型 ID，不包含 reasoning effort。 |
+| `CODEX_MODEL` | Codex 模型 ID，不包含 reasoning effort；目前最低建議為 `gpt-5.6-luna`。 |
 | `CODEX_REASONING_EFFORT` | `minimal`、`low`、`medium`、`high` 或 `xhigh`；翻譯通常先用 `low`。 |
 | `CODEX_TRANSPORT` | `exec` 每次啟動 CLI；`app-server` 使用 persistent transport。 |
 | `ENABLE_MICRO_BATCHING` | `true` 時將相容的短請求合併成較少的 CLI call。 |
