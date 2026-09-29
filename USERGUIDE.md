@@ -305,7 +305,66 @@ Codex virtual model: codex-translate
 Adapter 同時提供 Ollama-compatible endpoints 與 OpenAI-compatible
 `/v1/chat/completions`。如果修改 `ADAPTER_PORT`，Base URL 必須使用相同 port。
 
-## 8. 更新或移除 wheel
+## 8. 使用 `immerse-bench` 診斷效能
+
+發布包內的 `immerse-bench` 可以分別測量直接呼叫 CLI 與完整
+ImmerseWrapper HTTP API 的反應時間。它使用接近 Immersive Translate 的固定翻譯
+prompt，預設只在報告保存原文／譯文的字數與 SHA-256，不保存完整內容。
+
+這個工具會呼叫已登入的雲端模型並消耗 quota。第一次使用時，先執行不呼叫模型的
+preflight：
+
+```bash
+~/.venvs/immerse-wrapper/bin/python ./immerse-bench \
+  --env-file ~/.config/immerse-wrapper/immerse-wrapper.env \
+  --backend antigravity \
+  --target compare \
+  --runs 3 \
+  --warmup 1 \
+  --concurrency 1 \
+  --dry-run
+```
+
+確認計畫中的 backend、model、reasoning effort、transport 與 call count 後，移除
+`--dry-run` 執行測量。`compare` 會成對測量直接 CLI 與目前正在執行的 HTTP service；
+執行前必須先確認 service 為 `active (running)`。也可以只測其中一條路徑：
+
+```bash
+# 直接呼叫 Agy/Codex，不經過 ImmerseWrapper HTTP 或 micro-batch
+~/.venvs/immerse-wrapper/bin/python ./immerse-bench \
+  --target cli --backend antigravity --runs 3 --warmup 1
+
+# 只測完整 HTTP 路徑；service 必須已啟動
+~/.venvs/immerse-wrapper/bin/python ./immerse-bench \
+  --target api --backend antigravity --runs 3 --warmup 1
+
+# 保存可供比較的 JSON 報告；既有檔案不會被覆寫
+~/.venvs/immerse-wrapper/bin/python ./immerse-bench \
+  --target compare --backend antigravity \
+  --runs 5 --warmup 1 --format json --output agy-benchmark.json
+```
+
+設定值預設依序取自命令列、process environment、目前目錄的 `.env`，最後才是
+service 設定檔。從其他目錄執行發布包時，建議明確指定 `--env-file`。若要覆寫單次測試，
+可使用 `--model`、`--reasoning-effort`、`--codex-transport`、`--concurrency` 與
+`--timeout-seconds`；這些參數只影響 benchmark 的直接 CLI 路徑，不會改寫已啟動
+service 的設定。
+
+判讀時先比較兩個 target：
+
+- `cli` 本身時快時慢，代表變異已存在於 CLI、網路、provider queue 或模型生成的合併路徑；
+- `cli` 穩定但 `api` 明顯較慢，才進一步用報告中的 `X-Request-ID` 對照 service log 的
+  `response_sent`、`process_completed`、`micro_batch_completed` 或
+  `codex_app_server_turn_completed`；
+- API 不會回報底層實際 model／effort，因此 `compare` 前仍要人工確認執行中的 service
+  與報告使用相同設定，差值也不能直接解讀為純 Wrapper overhead。
+
+完整參數可用
+`~/.venvs/immerse-wrapper/bin/python ./immerse-bench --help` 查看。若要測自己的文字，可用
+`--text` 或 `--input-file`；完整原文與譯文只有在明確加入 `--include-source` 或
+`--include-translation` 時才會寫入報告。
+
+## 9. 更新或移除 wheel
 
 先停止正在執行的 ImmerseWrapper，再安裝新版：
 

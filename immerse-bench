@@ -1,0 +1,1685 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import ipaddress
+import json
+import math
+import os
+import random
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT_PATH.parents[2] if len(SCRIPT_PATH.parents) >= 3 else None
+if PROJECT_ROOT is not None and (PROJECT_ROOT / "app").is_dir():
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from pydantic import ValidationError  # noqa: E402
+
+from app import __version__  # noqa: E402
+from app.backends.antigravity import AntigravityBackend  # noqa: E402
+from app.backends.base import BackendResult  # noqa: E402
+from app.backends.codex import CodexBackend  # noqa: E402
+from app.backends.codex_app_server import CodexAppServerBackend  # noqa: E402
+from app.backends.errors import BackendError  # noqa: E402
+from app.config import (  # noqa: E402
+    BackendMode,
+    BackendName,
+    CodexTransport,
+    Settings,
+)
+from app.models.ollama import OllamaChatMessage  # noqa: E402
+from app.services.process_runner import ProcessRunner  # noqa: E402
+from app.services.prompt_builder import build_chat_prompt  # noqa: E402
+from app.startup import resolve_executable  # noqa: E402
+
+
+BENCHMARK_NAME = "immerse-bench"
+SCHEMA_VERSION = 1
+DEFAULT_SEED = 20260929
+CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+CASE_MARKER_PATTERN = re.compile(r"\bIW_BENCH_[A-Z0-9_]+\b")
+ENV_KEY_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+VIRTUAL_MODELS = {
+    "antigravity": "antigravity-translate",
+    "codex": "codex-translate",
+}
+
+
+class BenchmarkError(RuntimeError):
+    exit_code = 2
+
+
+class ConfigurationError(BenchmarkError):
+    exit_code = 2
+
+
+class PreflightError(BenchmarkError):
+    exit_code = 3
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkCase:
+    id: str
+    workload: str
+    text: str
+
+
+@dataclass(slots=True)
+class Sample:
+    sample_id: str
+    pair_id: str
+    backend: str
+    target: str
+    case_id: str
+    workload: str
+    model: str | None
+    reasoning_effort: str | None
+    transport: str
+    warmup: bool
+    wave: int
+    duration_ms: float
+    success: bool
+    error_category: str | None
+    error_message: str | None
+    queue_duration_ms: float | None
+    execution_duration_ms: float | None
+    http_status: int | None
+    request_id: str | None
+    batch_mode: str | None
+    stream_mode: str | None
+    source_chars: int
+    source_sha256: str
+    translation_chars: int | None
+    translation_sha256: str | None
+    usage: dict[str, Any] | None
+    source: str | None = None
+    translation: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveConfig:
+    settings: Settings
+    env_file: Path | None
+    env_keys: frozenset[str]
+    target: str
+    backends: tuple[str, ...]
+    base_url: str
+    runs: int
+    warmup: int
+    concurrency: int
+    timeout_seconds: float
+    cooldown_ms: int
+    workload: str
+    prompt_profile: str
+    order: str
+    seed: int
+    commands: dict[str, str]
+    models: dict[str, str | None]
+    efforts: dict[str, str | None]
+    codex_transport: str
+    include_source: bool
+    include_translation: bool
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _bounded_message(value: object, limit: int = 500) -> str:
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text[:limit]
+
+
+def _selected_env_file(args: argparse.Namespace) -> Path | None:
+    if args.env_file is not None:
+        path = Path(args.env_file).expanduser()
+        if not path.is_file():
+            raise ConfigurationError(f"environment file is not a readable file: {path}")
+        try:
+            path.open("rb").close()
+        except OSError as exc:
+            raise ConfigurationError(f"environment file is unreadable: {path}") from exc
+        return path.resolve()
+    if args.no_env_file:
+        return None
+    local = Path.cwd() / ".env"
+    if local.is_file():
+        return local.resolve()
+    service = Path.home() / ".config/immerse-wrapper/immerse-wrapper.env"
+    return service.resolve() if service.is_file() else None
+
+
+def _dotenv_keys(path: Path | None) -> frozenset[str]:
+    if path is None:
+        return frozenset()
+    keys: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = ENV_KEY_PATTERN.match(line.strip())
+            if match:
+                keys.add(match.group(1).upper())
+    except (OSError, UnicodeError) as exc:
+        raise ConfigurationError(f"failed to read environment file: {path}") from exc
+    return frozenset(keys)
+
+
+def _setting_source(
+    key: str,
+    *,
+    cli_override: bool,
+    env_keys: frozenset[str],
+) -> str:
+    if cli_override:
+        return "cli"
+    upper = key.upper()
+    if any(name.upper() == upper for name in os.environ):
+        return "process_env"
+    if upper in env_keys:
+        return "env_file"
+    return "default"
+
+
+def _resolve_single_override(
+    *,
+    generic: str | None,
+    specific: str | None,
+    label: str,
+) -> str | None:
+    if generic is not None and specific is not None and generic != specific:
+        raise ConfigurationError(
+            f"conflicting {label} overrides: generic={generic!r}, specific={specific!r}"
+        )
+    return specific if specific is not None else generic
+
+
+def _host_url(host: str, port: int) -> str:
+    rendered = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{rendered}:{port}"
+
+
+def _validate_base_url(url: str, *, allow_remote: bool) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ConfigurationError("base URL must be an absolute http or https URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ConfigurationError("base URL must not contain credentials, query, or fragment")
+    host = parsed.hostname
+    loopback = host.lower() == "localhost"
+    if not loopback:
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+    if not loopback and not allow_remote:
+        raise ConfigurationError(
+            "non-loopback API URL requires --allow-remote-api"
+        )
+    return url.rstrip("/")
+
+
+def _base_url_is_loopback(url: str) -> bool:
+    host = urlparse(url).hostname
+    if host is None:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _load_settings(path: Path | None) -> Settings:
+    try:
+        return Settings(_env_file=path if path is not None else None)
+    except (OSError, ValidationError, ValueError) as exc:
+        raise ConfigurationError(f"invalid ImmerseWrapper configuration: {exc}") from exc
+
+
+def _effective_config(args: argparse.Namespace) -> EffectiveConfig:
+    env_file = _selected_env_file(args)
+    env_keys = _dotenv_keys(env_file)
+    settings = _load_settings(env_file)
+
+    backend_selection = args.backend or settings.default_backend.value
+    if backend_selection not in {"antigravity", "codex", "all"}:
+        raise ConfigurationError(
+            "immerse-bench supports only antigravity and codex backends"
+        )
+    backends = (
+        ("antigravity", "codex")
+        if backend_selection == "all"
+        else (backend_selection,)
+    )
+    if len(backends) > 1 and any(
+        value is not None for value in (args.command, args.model, args.reasoning_effort)
+    ):
+        raise ConfigurationError(
+            "generic --command/--model/--reasoning-effort require one backend"
+        )
+
+    agy_command = _resolve_single_override(
+        generic=args.command if backends == ("antigravity",) else None,
+        specific=args.antigravity_command,
+        label="Antigravity command",
+    ) or settings.antigravity_command
+    codex_command = _resolve_single_override(
+        generic=args.command if backends == ("codex",) else None,
+        specific=args.codex_command,
+        label="Codex command",
+    ) or settings.codex_command
+    agy_model = _resolve_single_override(
+        generic=args.model if backends == ("antigravity",) else None,
+        specific=args.antigravity_model,
+        label="Antigravity model",
+    )
+    codex_model = _resolve_single_override(
+        generic=args.model if backends == ("codex",) else None,
+        specific=args.codex_model,
+        label="Codex model",
+    )
+    agy_effort = _resolve_single_override(
+        generic=args.reasoning_effort if backends == ("antigravity",) else None,
+        specific=args.antigravity_reasoning_effort,
+        label="Antigravity effort",
+    )
+    codex_effort = _resolve_single_override(
+        generic=args.reasoning_effort if backends == ("codex",) else None,
+        specific=args.codex_reasoning_effort,
+        label="Codex effort",
+    )
+
+    agy_model = agy_model if agy_model is not None else settings.antigravity_model
+    codex_model = codex_model if codex_model is not None else settings.codex_model
+    agy_effort = (
+        agy_effort
+        if agy_effort is not None
+        else (
+            settings.antigravity_reasoning_effort.value
+            if settings.antigravity_reasoning_effort
+            else None
+        )
+    )
+    codex_effort = (
+        codex_effort
+        if codex_effort is not None
+        else (
+            settings.codex_reasoning_effort.value
+            if settings.codex_reasoning_effort
+            else None
+        )
+    )
+    if agy_effort not in {None, "low", "medium", "high"}:
+        raise ConfigurationError("Antigravity effort must be low, medium, or high")
+    if codex_effort not in {None, "minimal", "low", "medium", "high", "xhigh"}:
+        raise ConfigurationError("Codex effort is invalid")
+
+    concurrency = (
+        args.concurrency if args.concurrency is not None else settings.max_concurrency
+    )
+    timeout = (
+        args.timeout_seconds
+        if args.timeout_seconds is not None
+        else settings.request_timeout_seconds
+    )
+    codex_transport = args.codex_transport or settings.codex_transport.value
+    if codex_transport == "app-server" and "codex" in backends and concurrency != 1:
+        raise ConfigurationError("Codex app-server benchmark requires concurrency 1")
+    if args.runs < 1 or args.runs > 100:
+        raise ConfigurationError("runs must be between 1 and 100")
+    if args.warmup < 0 or args.warmup > 20:
+        raise ConfigurationError("warmup must be between 0 and 20")
+    if concurrency < 1 or concurrency > 32:
+        raise ConfigurationError("concurrency must be between 1 and 32")
+    if timeout <= 0:
+        raise ConfigurationError("timeout must be positive")
+    if args.cooldown_ms < 0 or args.cooldown_ms > 60_000:
+        raise ConfigurationError("cooldown must be between 0 and 60000 ms")
+
+    base_url = _validate_base_url(
+        args.base_url or _host_url(settings.adapter_host, settings.adapter_port),
+        allow_remote=args.allow_remote_api,
+    )
+    return EffectiveConfig(
+        settings=settings,
+        env_file=env_file,
+        env_keys=env_keys,
+        target=args.target,
+        backends=backends,
+        base_url=base_url,
+        runs=args.runs,
+        warmup=args.warmup,
+        concurrency=concurrency,
+        timeout_seconds=timeout,
+        cooldown_ms=args.cooldown_ms,
+        workload=args.workload,
+        prompt_profile=args.prompt_profile,
+        order=args.order,
+        seed=args.seed,
+        commands={"antigravity": agy_command, "codex": codex_command},
+        models={"antigravity": agy_model, "codex": codex_model},
+        efforts={"antigravity": agy_effort, "codex": codex_effort},
+        codex_transport=codex_transport,
+        include_source=args.include_source,
+        include_translation=args.include_translation,
+    )
+
+
+def _case_file() -> Path:
+    development = SCRIPT_PATH.with_name("cases.json")
+    release = SCRIPT_PATH.with_name("immerse-bench.cases.json")
+    if development.is_file():
+        return development
+    if release.is_file():
+        return release
+    raise ConfigurationError("built-in benchmark case file is missing")
+
+
+def _load_cases(args: argparse.Namespace, config: EffectiveConfig) -> list[BenchmarkCase]:
+    if args.text is not None or args.input_file is not None:
+        if args.text is not None:
+            source = args.text
+        else:
+            try:
+                source = Path(args.input_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise ConfigurationError(f"failed to read input file: {exc}") from exc
+        source = source.strip()
+        if not source:
+            raise ConfigurationError("benchmark source text must not be empty")
+        marker = "IW_BENCH_CUSTOM"
+        return [BenchmarkCase(marker, "custom", f"{marker}: {source}")]
+
+    try:
+        payload = json.loads(_case_file().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"invalid built-in benchmark cases: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ConfigurationError("benchmark cases must be a JSON array")
+    cases: list[BenchmarkCase] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ConfigurationError("benchmark case must be a JSON object")
+        try:
+            case = BenchmarkCase(
+                id=str(item["id"]),
+                workload=str(item["workload"]),
+                text=str(item["text"]),
+            )
+        except KeyError as exc:
+            raise ConfigurationError("benchmark case is missing a required field") from exc
+        if not case.id or case.id not in case.text:
+            raise ConfigurationError(f"benchmark case marker is invalid: {case.id!r}")
+        cases.append(case)
+    if config.workload == "mixed":
+        selected = cases
+    else:
+        selected = [case for case in cases if case.workload == config.workload]
+    if not selected:
+        raise ConfigurationError(f"no benchmark cases for workload {config.workload!r}")
+    return selected
+
+
+def _messages(case: BenchmarkCase, profile: str) -> list[dict[str, str]]:
+    if profile == "minimal":
+        system = (
+            "Translate into Traditional Chinese (Taiwan). Preserve the marker and "
+            "output only the translation."
+        )
+    else:
+        system = (
+            "You are a professional Traditional Chinese (Taiwan) Language native "
+            "translator specialized in technology content who needs to fluently "
+            "translate text into Traditional Chinese (Taiwan) Language.\n\n"
+            "## Translation Rules\n"
+            "1. Output only the translated content, without explanations or additional content\n"
+            "2. Maintain all technical terminology, programming language syntax, and code snippets exactly as in the original\n"
+            "3. If the text contains HTML tags, consider where the tags should be placed in the translation while maintaining fluency\n"
+            "4. Preserve product names, company names, and technology abbreviations in their original form\n"
+            "5. Keep all UI elements, button names, and menu items as they appear in localized software when available\n"
+            "6. Translate technical concepts accurately while preserving their technical meaning\n"
+            "7. Ensure consistency in the translation of recurring technical terms throughout the document\n\n"
+            "## Context Awareness\nDocument Metadata:\n"
+            "Title: \"ImmerseWrapper Benchmark\""
+        )
+    user = (
+        "Translate to Traditional Chinese (Taiwan) Language "
+        f"(output translation only):\n\n{case.text}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _direct_prompt(case: BenchmarkCase, profile: str) -> str:
+    return build_chat_prompt(
+        OllamaChatMessage.model_validate(message)
+        for message in _messages(case, profile)
+    )
+
+
+def _validate_prompt_size(config: EffectiveConfig, cases: Iterable[BenchmarkCase]) -> None:
+    for case in cases:
+        prompt = _direct_prompt(case, config.prompt_profile)
+        if len(prompt) > config.settings.max_prompt_chars:
+            raise ConfigurationError(
+                f"case {case.id} exceeds MAX_PROMPT_CHARS after prompt construction"
+            )
+
+
+def _http_json(
+    url: str,
+    *,
+    timeout_seconds: float,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, str], dict[str, Any], float]:
+    data = None
+    headers = {"Accept": "application/json"}
+    method = "GET"
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        method = "POST"
+    request = Request(url, data=data, headers=headers, method=method)
+    started = time.perf_counter()
+    opener = build_opener(NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout_seconds) as response:
+            raw = response.read()
+            status = int(response.status)
+            response_headers = {key.lower(): value for key, value in response.headers.items()}
+    except HTTPError as exc:
+        raw = exc.read()
+        status = int(exc.code)
+        response_headers = {key.lower(): value for key, value in exc.headers.items()}
+    elapsed = (time.perf_counter() - started) * 1000
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PreflightError(f"non-JSON response from {url}") from exc
+    if not isinstance(body, dict):
+        raise PreflightError(f"JSON object expected from {url}")
+    return status, response_headers, body, elapsed
+
+
+def _command_version(executable: str) -> str:
+    try:
+        completed = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PreflightError(f"failed to query {executable!r} version: {exc}") from exc
+    output = (completed.stdout or completed.stderr).strip()
+    if completed.returncode != 0 or not output:
+        raise PreflightError(f"{executable!r} --version failed")
+    return _bounded_message(output, 200)
+
+
+def _preflight(
+    args: argparse.Namespace,
+    config: EffectiveConfig,
+    cases: list[BenchmarkCase],
+) -> dict[str, Any]:
+    _validate_prompt_size(config, cases)
+    direct_required = config.target in {"cli", "compare"}
+    api_required = config.target in {"api", "compare"}
+    executables: dict[str, str] = {}
+    versions: dict[str, str] = {}
+    if direct_required:
+        for backend in config.backends:
+            executable = resolve_executable(config.commands[backend])
+            if executable is None:
+                raise PreflightError(
+                    f"{backend} executable was not found: {config.commands[backend]}"
+                )
+            executables[backend] = executable
+            versions[backend] = _command_version(executable)
+
+    health: dict[str, Any] | None = None
+    tags: dict[str, Any] | None = None
+    if api_required:
+        if config.settings.backend_mode is BackendMode.MOCK and not args.allow_mock_api:
+            raise PreflightError(
+                "selected local configuration declares BACKEND_MODE=mock; "
+                "use the service CLI profile or explicitly pass --allow-mock-api"
+            )
+        try:
+            status, _, health, _ = _http_json(
+                f"{config.base_url}/health",
+                timeout_seconds=min(config.timeout_seconds, 10),
+            )
+            tag_status, _, tags, _ = _http_json(
+                f"{config.base_url}/api/tags",
+                timeout_seconds=min(config.timeout_seconds, 10),
+            )
+        except (OSError, TimeoutError, URLError) as exc:
+            raise PreflightError(f"service preflight failed: {exc}") from exc
+        if status != 200 or health.get("status") != "ok":
+            raise PreflightError("service health endpoint is not ready")
+        if tag_status != 200:
+            raise PreflightError("service tags endpoint is not ready")
+        available = {
+            item.get("name")
+            for item in tags.get("models", [])
+            if isinstance(item, dict)
+        }
+        for backend in config.backends:
+            virtual_model = VIRTUAL_MODELS[backend]
+            if virtual_model not in available:
+                raise PreflightError(f"API virtual model is missing: {virtual_model}")
+
+    return {
+        "executables": executables,
+        "versions": versions,
+        "health": health,
+        "tags_checked": tags is not None,
+    }
+
+
+def _direct_settings(
+    config: EffectiveConfig,
+    backend: str,
+    *,
+    runtime_dir: Path,
+    request_root: Path,
+    state_dir: Path,
+) -> Settings:
+    values = config.settings.model_dump()
+    values.update(
+        {
+            "backend_mode": BackendMode.CLI,
+            "default_backend": backend,
+            "enable_antigravity": backend == "antigravity",
+            "enable_codex": backend == "codex",
+            "enable_legacy_gemini": False,
+            "max_concurrency": config.concurrency,
+            "request_timeout_seconds": config.timeout_seconds,
+            "adapter_runtime_dir": runtime_dir,
+            "adapter_request_work_root": request_root,
+            "adapter_state_dir": state_dir,
+            "antigravity_command": config.commands["antigravity"],
+            "antigravity_model": config.models["antigravity"],
+            "antigravity_reasoning_effort": config.efforts["antigravity"],
+            "codex_command": config.commands["codex"],
+            "codex_model": config.models["codex"],
+            "codex_reasoning_effort": config.efforts["codex"],
+            "codex_transport": (
+                config.codex_transport if backend == "codex" else CodexTransport.EXEC
+            ),
+            "codex_app_server_fallback_to_exec": False,
+        }
+    )
+    try:
+        return Settings(_env_file=None, **values)
+    except (ValidationError, ValueError) as exc:
+        raise ConfigurationError(f"invalid direct benchmark settings: {exc}") from exc
+
+
+async def _build_direct_backend(
+    config: EffectiveConfig,
+    backend: str,
+    executable: str,
+    root: Path,
+) -> tuple[Any, float | None]:
+    runtime = root / "runtime"
+    requests = root / "requests"
+    state = root / "state"
+    for path in (runtime, requests, state):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    settings = _direct_settings(
+        config,
+        backend,
+        runtime_dir=runtime,
+        request_root=requests,
+        state_dir=state,
+    )
+    runner = ProcessRunner.from_settings(settings)
+    if backend == "antigravity":
+        return (
+            AntigravityBackend(
+                settings=settings,
+                executable=executable,
+                runner=runner,
+                request_work_root=requests,
+            ),
+            None,
+        )
+    if config.codex_transport == "app-server":
+        implementation = CodexAppServerBackend(
+            settings=settings,
+            executable=executable,
+            runner=runner,
+            runtime_dir=runtime,
+            request_work_root=requests,
+        )
+        started = time.perf_counter()
+        await implementation.astart()
+        return implementation, (time.perf_counter() - started) * 1000
+    return (
+        CodexBackend(
+            settings=settings,
+            executable=executable,
+            runner=runner,
+            request_work_root=requests,
+        ),
+        None,
+    )
+
+
+def _translation_fields(
+    text: str,
+    case: BenchmarkCase,
+    *,
+    include_translation: bool,
+) -> tuple[bool, str | None, int, str, str | None]:
+    markers = set(CASE_MARKER_PATTERN.findall(text))
+    valid = (
+        bool(text.strip())
+        and CJK_PATTERN.search(text) is not None
+        and markers == {case.id}
+    )
+    return (
+        valid,
+        None if valid else "translation_validation_failed",
+        len(text),
+        _sha256(text),
+        text if include_translation else None,
+    )
+
+
+def _error_category(exc: BaseException) -> str:
+    if isinstance(exc, BackendError):
+        return exc.code.lower()
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return "timeout"
+    if isinstance(exc, (URLError, OSError)):
+        return "connection_error"
+    return "unexpected_error"
+
+
+async def _direct_sample(
+    *,
+    implementation: Any,
+    config: EffectiveConfig,
+    backend: str,
+    case: BenchmarkCase,
+    sample_id: str,
+    pair_id: str,
+    warmup: bool,
+    wave: int,
+) -> Sample:
+    prompt = _direct_prompt(case, config.prompt_profile)
+    started = time.perf_counter()
+    try:
+        result: BackendResult = await implementation.generate(
+            prompt,
+            f"bench-{uuid.uuid4().hex}",
+            config.timeout_seconds,
+        )
+        elapsed = (time.perf_counter() - started) * 1000
+        valid, error, chars, digest, translation = _translation_fields(
+            result.text,
+            case,
+            include_translation=config.include_translation,
+        )
+        metadata = result.raw_metadata or {}
+        return Sample(
+            sample_id=sample_id,
+            pair_id=pair_id,
+            backend=backend,
+            target="cli",
+            case_id=case.id,
+            workload=case.workload,
+            model=config.models[backend],
+            reasoning_effort=config.efforts[backend],
+            transport=config.codex_transport if backend == "codex" else "print",
+            warmup=warmup,
+            wave=wave,
+            duration_ms=round(elapsed, 3),
+            success=valid,
+            error_category=error,
+            error_message=None if valid else "translation did not preserve marker/CJK",
+            queue_duration_ms=_optional_float(metadata.get("queue_duration_ms")),
+            execution_duration_ms=float(result.duration_ms),
+            http_status=None,
+            request_id=None,
+            batch_mode=None,
+            stream_mode=None,
+            source_chars=len(case.text),
+            source_sha256=_sha256(case.text),
+            translation_chars=chars,
+            translation_sha256=digest,
+            usage=result.usage,
+            source=case.text if config.include_source else None,
+            translation=translation,
+        )
+    except Exception as exc:  # converted into a benchmark sample
+        elapsed = (time.perf_counter() - started) * 1000
+        return _failed_sample(
+            config=config,
+            backend=backend,
+            target="cli",
+            case=case,
+            sample_id=sample_id,
+            pair_id=pair_id,
+            warmup=warmup,
+            wave=wave,
+            duration_ms=elapsed,
+            category=_error_category(exc),
+            message=_bounded_message(exc),
+        )
+
+
+def _optional_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _failed_sample(
+    *,
+    config: EffectiveConfig,
+    backend: str,
+    target: str,
+    case: BenchmarkCase,
+    sample_id: str,
+    pair_id: str,
+    warmup: bool,
+    wave: int,
+    duration_ms: float,
+    category: str,
+    message: str,
+    http_status: int | None = None,
+    request_id: str | None = None,
+    batch_mode: str | None = None,
+    stream_mode: str | None = None,
+) -> Sample:
+    return Sample(
+        sample_id=sample_id,
+        pair_id=pair_id,
+        backend=backend,
+        target=target,
+        case_id=case.id,
+        workload=case.workload,
+        model=config.models[backend] if target == "cli" else None,
+        reasoning_effort=config.efforts[backend] if target == "cli" else None,
+        transport=(
+            config.codex_transport if backend == "codex" and target == "cli" else
+            "print" if backend == "antigravity" and target == "cli" else
+            "http"
+        ),
+        warmup=warmup,
+        wave=wave,
+        duration_ms=round(duration_ms, 3),
+        success=False,
+        error_category=category,
+        error_message=message,
+        queue_duration_ms=None,
+        execution_duration_ms=None,
+        http_status=http_status,
+        request_id=request_id,
+        batch_mode=batch_mode,
+        stream_mode=stream_mode,
+        source_chars=len(case.text),
+        source_sha256=_sha256(case.text),
+        translation_chars=None,
+        translation_sha256=None,
+        usage=None,
+        source=case.text if config.include_source else None,
+        translation=None,
+    )
+
+
+def _api_sample_sync(
+    *,
+    config: EffectiveConfig,
+    backend: str,
+    case: BenchmarkCase,
+    sample_id: str,
+    pair_id: str,
+    warmup: bool,
+    wave: int,
+) -> Sample:
+    payload = {
+        "model": VIRTUAL_MODELS[backend],
+        "temperature": 0,
+        "stream": False,
+        "messages": _messages(case, config.prompt_profile),
+        "keep_alive": "5m",
+    }
+    started = time.perf_counter()
+    try:
+        status, headers, body, _ = _http_json(
+            f"{config.base_url}/v1/chat/completions",
+            timeout_seconds=config.timeout_seconds,
+            payload=payload,
+        )
+        elapsed = (time.perf_counter() - started) * 1000
+    except Exception as exc:
+        elapsed = (time.perf_counter() - started) * 1000
+        return _failed_sample(
+            config=config,
+            backend=backend,
+            target="api",
+            case=case,
+            sample_id=sample_id,
+            pair_id=pair_id,
+            warmup=warmup,
+            wave=wave,
+            duration_ms=elapsed,
+            category=_error_category(exc),
+            message=_bounded_message(exc),
+        )
+
+    request_id = headers.get("x-request-id")
+    batch_mode = headers.get("x-adapter-batch-mode")
+    stream_mode = headers.get("x-adapter-stream-mode")
+    expected_headers = (
+        status == 200
+        and headers.get("x-adapter-backend") == backend
+        and stream_mode == "non-streaming"
+        and batch_mode in {
+            "direct",
+            "singleton",
+            "batched",
+            "batched-partial",
+            "fallback",
+        }
+        and isinstance(request_id, str)
+        and bool(re.fullmatch(r"[0-9a-f]{32}", request_id))
+    )
+    if status != 200 or not expected_headers:
+        category = str(body.get("code") or "api_protocol_error").lower()
+        return _failed_sample(
+            config=config,
+            backend=backend,
+            target="api",
+            case=case,
+            sample_id=sample_id,
+            pair_id=pair_id,
+            warmup=warmup,
+            wave=wave,
+            duration_ms=elapsed,
+            category=category,
+            message=_bounded_message(body.get("error") or "invalid API status or headers"),
+            http_status=status,
+            request_id=request_id,
+            batch_mode=batch_mode,
+            stream_mode=stream_mode,
+        )
+    try:
+        content = body["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            raise TypeError("assistant content is not a string")
+    except (KeyError, IndexError, TypeError) as exc:
+        return _failed_sample(
+            config=config,
+            backend=backend,
+            target="api",
+            case=case,
+            sample_id=sample_id,
+            pair_id=pair_id,
+            warmup=warmup,
+            wave=wave,
+            duration_ms=elapsed,
+            category="api_protocol_error",
+            message=_bounded_message(exc),
+            http_status=status,
+            request_id=request_id,
+            batch_mode=batch_mode,
+            stream_mode=stream_mode,
+        )
+    valid, error, chars, digest, translation = _translation_fields(
+        content,
+        case,
+        include_translation=config.include_translation,
+    )
+    return Sample(
+        sample_id=sample_id,
+        pair_id=pair_id,
+        backend=backend,
+        target="api",
+        case_id=case.id,
+        workload=case.workload,
+        model=None,
+        reasoning_effort=None,
+        transport="http",
+        warmup=warmup,
+        wave=wave,
+        duration_ms=round(elapsed, 3),
+        success=valid,
+        error_category=error,
+        error_message=None if valid else "translation did not preserve marker/CJK",
+        queue_duration_ms=None,
+        execution_duration_ms=None,
+        http_status=status,
+        request_id=request_id,
+        batch_mode=batch_mode,
+        stream_mode=stream_mode,
+        source_chars=len(case.text),
+        source_sha256=_sha256(case.text),
+        translation_chars=chars,
+        translation_sha256=digest,
+        usage=None,
+        source=case.text if config.include_source else None,
+        translation=translation,
+    )
+
+
+async def _api_sample(**kwargs: Any) -> Sample:
+    return await asyncio.to_thread(_api_sample_sync, **kwargs)
+
+
+def _target_order(config: EffectiveConfig, index: int, rng: random.Random) -> tuple[str, ...]:
+    if config.target != "compare":
+        return (config.target,)
+    if config.order == "cli-first":
+        return ("cli", "api")
+    if config.order == "api-first":
+        return ("api", "cli")
+    if config.order == "random":
+        return ("cli", "api") if rng.random() < 0.5 else ("api", "cli")
+    return ("cli", "api") if index % 2 == 0 else ("api", "cli")
+
+
+async def _run_backend_group(
+    *,
+    args: argparse.Namespace,
+    config: EffectiveConfig,
+    backend: str,
+    cases: list[BenchmarkCase],
+    preflight: dict[str, Any],
+    temp_root: Path,
+) -> tuple[list[Sample], float | None]:
+    direct = None
+    handshake_ms = None
+    if config.target in {"cli", "compare"}:
+        try:
+            direct, handshake_ms = await _build_direct_backend(
+                config,
+                backend,
+                preflight["executables"][backend],
+                temp_root / backend,
+            )
+        except (BackendError, OSError, ValueError) as exc:
+            raise PreflightError(
+                f"failed to initialize {backend} direct transport: "
+                f"{_bounded_message(exc)}"
+            ) from exc
+    samples: list[Sample] = []
+    rng = random.Random(config.seed + (1 if backend == "codex" else 0))
+    total = config.warmup + config.runs
+    entries = [
+        (index, cases[index % len(cases)], index < config.warmup)
+        for index in range(total)
+    ]
+    try:
+        for wave, start in enumerate(range(0, total, config.concurrency), start=1):
+            group = entries[start : start + config.concurrency]
+            order = _target_order(config, wave - 1, rng)
+            for target in order:
+                coroutines = []
+                for index, case, warmup in group:
+                    pair_id = f"{backend}-{index + 1:04d}"
+                    common = {
+                        "config": config,
+                        "backend": backend,
+                        "case": case,
+                        "sample_id": f"{pair_id}-{target}",
+                        "pair_id": pair_id,
+                        "warmup": warmup,
+                        "wave": wave,
+                    }
+                    if target == "cli":
+                        coroutines.append(_direct_sample(implementation=direct, **common))
+                    else:
+                        coroutines.append(_api_sample(**common))
+                results = await asyncio.gather(*coroutines)
+                samples.extend(results)
+                if args.verbose:
+                    for sample in results:
+                        print(
+                            f"{sample.sample_id} success={sample.success} "
+                            f"duration_ms={sample.duration_ms}",
+                            file=sys.stderr,
+                        )
+                if args.fail_fast and any(not sample.success for sample in results):
+                    return samples, handshake_ms
+                if config.cooldown_ms:
+                    await asyncio.sleep(config.cooldown_ms / 1000)
+    finally:
+        if direct is not None:
+            close = getattr(direct, "aclose", None)
+            if close is not None:
+                await close()
+    return samples, handshake_ms
+
+
+def _nearest_rank(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return round(ordered[index], 3)
+
+
+def _numeric_summary(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "median": None,
+            "p50": None,
+            "p90": None,
+            "p95": None,
+            "population_stddev": None,
+            "cv": None,
+        }
+    mean = statistics.fmean(values)
+    stddev = statistics.pstdev(values)
+    median = _nearest_rank(values, 0.50)
+    return {
+        "count": len(values),
+        "min": round(min(values), 3),
+        "max": round(max(values), 3),
+        "mean": round(mean, 3),
+        "median": median,
+        "p50": median,
+        "p90": _nearest_rank(values, 0.90),
+        "p95": _nearest_rank(values, 0.95),
+        "population_stddev": round(stddev, 3),
+        "cv": round(stddev / mean, 6) if mean else None,
+    }
+
+
+def _summaries(samples: list[Sample]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[Sample]] = {}
+    for sample in samples:
+        if not sample.warmup:
+            groups.setdefault((sample.backend, sample.target), []).append(sample)
+    summaries: list[dict[str, Any]] = []
+    for (backend, target), group in sorted(groups.items()):
+        successes = [sample for sample in group if sample.success]
+        durations = [sample.duration_ms for sample in successes]
+        queue = [sample.queue_duration_ms for sample in successes if sample.queue_duration_ms is not None]
+        execution = [sample.execution_duration_ms for sample in successes if sample.execution_duration_ms is not None]
+        timeouts = [
+            sample for sample in group
+            if sample.error_category and "timeout" in sample.error_category
+        ]
+        usage = Counter()
+        for sample in successes:
+            for key, value in (sample.usage or {}).items():
+                if isinstance(value, int):
+                    usage[key] += value
+        summaries.append(
+            {
+                "backend": backend,
+                "target": target,
+                "attempted": len(group),
+                "succeeded": len(successes),
+                "failed": len(group) - len(successes),
+                "timed_out": len(timeouts),
+                "success_rate": round(len(successes) / len(group), 6) if group else None,
+                "timeout_rate": round(len(timeouts) / len(group), 6) if group else None,
+                "duration_ms": _numeric_summary(durations),
+                "queue_duration_ms": _numeric_summary(queue),
+                "execution_duration_ms": _numeric_summary(execution),
+                "batch_modes": dict(sorted(Counter(
+                    sample.batch_mode for sample in successes if sample.batch_mode
+                ).items())),
+                "usage": dict(sorted(usage.items())) or None,
+            }
+        )
+    return summaries
+
+
+def _comparisons(samples: list[Sample]) -> list[dict[str, Any]]:
+    paired: dict[tuple[str, str], dict[str, Sample]] = {}
+    for sample in samples:
+        if not sample.warmup:
+            paired.setdefault((sample.backend, sample.pair_id), {})[sample.target] = sample
+    by_backend: dict[str, list[tuple[float, float]]] = {}
+    for (backend, _), pair in paired.items():
+        cli = pair.get("cli")
+        api = pair.get("api")
+        if cli and api and cli.success and api.success and cli.duration_ms > 0:
+            by_backend.setdefault(backend, []).append(
+                (api.duration_ms - cli.duration_ms, api.duration_ms / cli.duration_ms)
+            )
+    return [
+        {
+            "backend": backend,
+            "paired_samples": len(values),
+            "api_minus_cli_ms": _numeric_summary([item[0] for item in values]),
+            "api_over_cli_ratio": _numeric_summary([item[1] for item in values]),
+            "api_model_verified": False,
+        }
+        for backend, values in sorted(by_backend.items())
+    ]
+
+
+def _observations(
+    summaries: list[dict[str, Any]],
+    comparisons: list[dict[str, Any]],
+    samples: list[Sample],
+    concurrency: int,
+) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for summary in summaries:
+        duration = summary["duration_ms"]
+        if summary["target"] == "cli" and duration["p50"]:
+            ratio = duration["p95"] / duration["p50"] if duration["p95"] else 0
+            if (duration["cv"] or 0) >= 0.25 or ratio >= 1.5:
+                result.append(
+                    {
+                        "code": "upstream_or_cli_variability",
+                        "backend": summary["backend"],
+                        "message": "Direct CLI latency is variable; inspect the combined CLI/network/provider/model path.",
+                    }
+                )
+        if summary["timed_out"]:
+            result.append(
+                {
+                    "code": "api_timeouts" if summary["target"] == "api" else "backend_timeouts",
+                    "backend": summary["backend"],
+                    "message": f"{summary['timed_out']} measured sample(s) timed out.",
+                }
+            )
+    summary_map = {(item["backend"], item["target"]): item for item in summaries}
+    for comparison in comparisons:
+        backend = comparison["backend"]
+        cli = summary_map.get((backend, "cli"))
+        delta = comparison["api_minus_cli_ms"]["p50"]
+        if cli and delta is not None:
+            cli_p50 = cli["duration_ms"]["p50"] or 0
+            if (cli["duration_ms"]["cv"] or 0) < 0.25 and delta >= max(250, cli_p50 * 0.2):
+                result.append(
+                    {
+                        "code": "wrapper_path_overhead_suspected",
+                        "backend": backend,
+                        "message": "The paired API median materially exceeds the stable direct CLI median; correlate request IDs with service logs.",
+                    }
+                )
+        result.append(
+            {
+                "code": "comparison_model_unverified",
+                "backend": backend,
+                "message": "The API does not expose its underlying model/effort; confirm the running service configuration before attributing the difference.",
+            }
+        )
+    if concurrency > 1:
+        api_groups: dict[str, list[Sample]] = {}
+        for sample in samples:
+            if sample.target == "api" and sample.success and not sample.warmup:
+                api_groups.setdefault(sample.backend, []).append(sample)
+        for backend, group in sorted(api_groups.items()):
+            first_wave = min(sample.wave for sample in group)
+            baseline = [
+                sample.duration_ms for sample in group if sample.wave == first_wave
+            ]
+            later = [sample.duration_ms for sample in group if sample.wave > first_wave]
+            if baseline and later:
+                baseline_mean = statistics.fmean(baseline)
+                later_mean = statistics.fmean(later)
+                if later_mean >= baseline_mean + 250 and later_mean >= baseline_mean * 1.2:
+                    result.append(
+                        {
+                            "code": "queue_or_concurrency_pressure",
+                            "backend": backend,
+                            "message": "Later concurrent API waves are materially slower than the first wave; correlate request IDs with service queue and batch logs.",
+                        }
+                    )
+    return result
+
+
+def _config_report(args: argparse.Namespace, config: EffectiveConfig) -> dict[str, Any]:
+    generic_model = args.model is not None
+    generic_effort = args.reasoning_effort is not None
+    return {
+        "env_file": str(config.env_file) if config.env_file else None,
+        "target": config.target,
+        "backends": list(config.backends),
+        "base_url": config.base_url,
+        "runs": config.runs,
+        "warmup": config.warmup,
+        "concurrency": config.concurrency,
+        "timeout_seconds": config.timeout_seconds,
+        "cooldown_ms": config.cooldown_ms,
+        "workload": config.workload,
+        "prompt_profile": config.prompt_profile,
+        "order": config.order,
+        "seed": config.seed,
+        "commands": config.commands,
+        "models": config.models,
+        "reasoning_efforts": config.efforts,
+        "codex_transport": config.codex_transport,
+        "service_profile": {
+            "enable_micro_batching": config.settings.enable_micro_batching,
+            "batch_window_ms": config.settings.batch_window_ms,
+            "batch_max_items": config.settings.batch_max_items,
+            "batch_max_pending": config.settings.batch_max_pending,
+        },
+        "sources": {
+            "backend": "cli" if args.backend is not None else _setting_source(
+                "DEFAULT_BACKEND", cli_override=False, env_keys=config.env_keys
+            ),
+            "concurrency": "cli" if args.concurrency is not None else _setting_source(
+                "MAX_CONCURRENCY", cli_override=False, env_keys=config.env_keys
+            ),
+            "timeout_seconds": "cli" if args.timeout_seconds is not None else _setting_source(
+                "REQUEST_TIMEOUT_SECONDS", cli_override=False, env_keys=config.env_keys
+            ),
+            "antigravity_model": _setting_source(
+                "ANTIGRAVITY_MODEL",
+                cli_override=generic_model or args.antigravity_model is not None,
+                env_keys=config.env_keys,
+            ),
+            "codex_model": _setting_source(
+                "CODEX_MODEL",
+                cli_override=generic_model or args.codex_model is not None,
+                env_keys=config.env_keys,
+            ),
+            "antigravity_reasoning_effort": _setting_source(
+                "ANTIGRAVITY_REASONING_EFFORT",
+                cli_override=generic_effort or args.antigravity_reasoning_effort is not None,
+                env_keys=config.env_keys,
+            ),
+            "codex_reasoning_effort": _setting_source(
+                "CODEX_REASONING_EFFORT",
+                cli_override=generic_effort or args.codex_reasoning_effort is not None,
+                env_keys=config.env_keys,
+            ),
+        },
+    }
+
+
+def _plan(config: EffectiveConfig, cases: list[BenchmarkCase]) -> dict[str, Any]:
+    target_count = 2 if config.target == "compare" else 1
+    calls = len(config.backends) * target_count * (config.warmup + config.runs)
+    return {
+        "quota_consuming_calls": calls,
+        "backend_count": len(config.backends),
+        "target_count": target_count,
+        "warmup_calls": len(config.backends) * target_count * config.warmup,
+        "measured_calls": len(config.backends) * target_count * config.runs,
+        "case_ids": [case.id for case in cases],
+    }
+
+
+async def _execute(
+    args: argparse.Namespace,
+    config: EffectiveConfig,
+    cases: list[BenchmarkCase],
+    preflight: dict[str, Any],
+    samples: list[Sample],
+    handshakes: dict[str, float],
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="immerse-bench-") as temporary:
+        root = Path(temporary)
+        for backend in config.backends:
+            backend_samples, handshake = await _run_backend_group(
+                args=args,
+                config=config,
+                backend=backend,
+                cases=cases,
+                preflight=preflight,
+                temp_root=root,
+            )
+            samples.extend(backend_samples)
+            if handshake is not None:
+                handshakes[backend] = round(handshake, 3)
+            if args.fail_fast and any(not sample.success for sample in backend_samples):
+                break
+
+
+def _render_text(report: dict[str, Any]) -> str:
+    config = report["effective_config"]
+    plan = report["plan"]
+    lines = [
+        f"{BENCHMARK_NAME} schema={SCHEMA_VERSION} status={report['status']}",
+        f"env_file={config['env_file'] or 'none'}",
+        f"target={config['target']} backends={','.join(config['backends'])} "
+        f"runs={config['runs']} warmup={config['warmup']} concurrency={config['concurrency']}",
+        f"workload={config['workload']} prompt_profile={config['prompt_profile']} "
+        f"quota_calls={plan['quota_consuming_calls']}",
+        "",
+        "backend      target  ok/total  p50_ms    p95_ms    mean_ms   cv",
+    ]
+    for item in report["summaries"]:
+        duration = item["duration_ms"]
+        lines.append(
+            f"{item['backend']:<12} {item['target']:<7} "
+            f"{item['succeeded']:>2}/{item['attempted']:<5} "
+            f"{_display_number(duration['p50']):>9} "
+            f"{_display_number(duration['p95']):>9} "
+            f"{_display_number(duration['mean']):>9} "
+            f"{_display_number(duration['cv']):>8}"
+        )
+    if report["comparisons"]:
+        lines.extend(["", "paired comparison (observational):"])
+        for item in report["comparisons"]:
+            lines.append(
+                f"  {item['backend']}: pairs={item['paired_samples']} "
+                f"p50_api_minus_cli_ms={_display_number(item['api_minus_cli_ms']['p50'])} "
+                f"p95_ratio={_display_number(item['api_over_cli_ratio']['p95'])}"
+            )
+    if report["observations"]:
+        lines.extend(["", "observations:"])
+        for item in report["observations"]:
+            lines.append(f"  - {item['backend']} {item['code']}: {item['message']}")
+    request_ids = [sample["request_id"] for sample in report["samples"] if sample["request_id"]]
+    if request_ids:
+        lines.extend(
+            [
+                "",
+                "Correlate API request IDs with response_sent, process_completed, "
+                "micro_batch_completed, or codex_app_server_turn_completed logs.",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _display_number(value: object) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _render(report: dict[str, Any], output_format: str) -> str:
+    if output_format == "text":
+        return _render_text(report)
+    if output_format == "json":
+        return json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    events: list[dict[str, Any]] = [
+        {
+            "event": "metadata",
+            "schema_version": report["schema_version"],
+            "benchmark": report["benchmark"],
+            "started_at": report["started_at"],
+            "effective_config": report["effective_config"],
+            "preflight": report["preflight"],
+            "plan": report["plan"],
+        }
+    ]
+    events.extend({"event": "sample", "sample": sample} for sample in report["samples"])
+    events.extend({"event": "summary", "summary": item} for item in report["summaries"])
+    events.extend({"event": "comparison", "comparison": item} for item in report["comparisons"])
+    events.append(
+        {
+            "event": "result",
+            "status": report["status"],
+            "duration_ms": report["duration_ms"],
+            "observations": report["observations"],
+        }
+    )
+    return "".join(
+        json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        for event in events
+    )
+
+
+def _write_output(path_text: str, content: str, *, force: bool) -> None:
+    path = Path(path_text).expanduser()
+    parent = path.parent.resolve()
+    if not parent.is_dir():
+        raise ConfigurationError(f"output parent directory does not exist: {parent}")
+    path = parent / path.name
+    if path.exists() and not force:
+        raise ConfigurationError(f"output file exists; use --force: {path}")
+    temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _validate_output_destination(path_text: str | None, *, force: bool) -> None:
+    if path_text is None:
+        return
+    path = Path(path_text).expanduser()
+    try:
+        parent = path.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"output parent directory does not exist: {path.parent}"
+        ) from exc
+    if not parent.is_dir():
+        raise ConfigurationError(f"output parent is not a directory: {parent}")
+    resolved = parent / path.name
+    if resolved.exists() and not force:
+        raise ConfigurationError(f"output file exists; use --force: {resolved}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=BENCHMARK_NAME,
+        description=(
+            "Compare direct Agy/Codex translation latency with the running "
+            "ImmerseWrapper HTTP API. This command consumes model quota."
+        ),
+    )
+    parser.add_argument("--target", choices=("cli", "api", "compare"), default="compare")
+    parser.add_argument("--backend", choices=("antigravity", "codex", "all"))
+    env_group = parser.add_mutually_exclusive_group()
+    env_group.add_argument("--env-file")
+    env_group.add_argument("--no-env-file", action="store_true")
+    parser.add_argument("--base-url")
+    parser.add_argument("--allow-remote-api", action="store_true")
+    parser.add_argument("--allow-mock-api", action="store_true")
+    parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--timeout-seconds", type=float)
+    parser.add_argument("--cooldown-ms", type=int, default=0)
+    parser.add_argument("--workload", choices=("short", "medium", "long", "mixed"), default="short")
+    parser.add_argument("--prompt-profile", choices=("immersive", "minimal"), default="immersive")
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument("--text")
+    input_group.add_argument("--input-file")
+    parser.add_argument("--order", choices=("alternate", "cli-first", "api-first", "random"), default="alternate")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--format", choices=("text", "json", "jsonl"), default="text")
+    parser.add_argument("--output")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--include-source", action="store_true")
+    parser.add_argument("--include-translation", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--command")
+    parser.add_argument("--model")
+    parser.add_argument("--reasoning-effort")
+    parser.add_argument("--antigravity-command")
+    parser.add_argument("--antigravity-model")
+    parser.add_argument("--antigravity-reasoning-effort", choices=("low", "medium", "high"))
+    parser.add_argument("--codex-command")
+    parser.add_argument("--codex-model")
+    parser.add_argument("--codex-reasoning-effort", choices=("minimal", "low", "medium", "high", "xhigh"))
+    parser.add_argument("--codex-transport", choices=("exec", "app-server"))
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return parser
+
+
+def _build_report(
+    *,
+    args: argparse.Namespace,
+    config: EffectiveConfig,
+    preflight: dict[str, Any],
+    plan: dict[str, Any],
+    started_at: str,
+    started: float,
+    samples: list[Sample],
+    handshakes: dict[str, float],
+    dry_run: bool,
+    status_override: str | None = None,
+) -> dict[str, Any]:
+    sample_dicts = [asdict(sample) for sample in samples]
+    summaries = _summaries(samples)
+    comparisons = _comparisons(samples)
+    failed = any(not sample.success for sample in samples)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "benchmark": BENCHMARK_NAME,
+        "benchmark_version": __version__,
+        "started_at": started_at,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "effective_config": _config_report(args, config),
+        "preflight": {**preflight, "app_server_handshake_ms": handshakes},
+        "plan": plan,
+        "samples": sample_dicts,
+        "summaries": summaries,
+        "comparisons": comparisons,
+        "observations": _observations(
+            summaries,
+            comparisons,
+            samples,
+            config.concurrency,
+        ),
+        "status": (
+            status_override
+            if status_override is not None
+            else "dry-run" if dry_run else "failed" if failed else "ok"
+        ),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    started = time.perf_counter()
+    started_at = _utc_now()
+    config: EffectiveConfig | None = None
+    preflight: dict[str, Any] | None = None
+    plan: dict[str, Any] | None = None
+    samples: list[Sample] = []
+    handshakes: dict[str, float] = {}
+    try:
+        config = _effective_config(args)
+        cases = _load_cases(args, config)
+        plan = _plan(config, cases)
+        _validate_output_destination(args.output, force=args.force)
+        print(
+            f"{BENCHMARK_NAME}: env_file={config.env_file or 'none'} "
+            f"quota_consuming_calls={plan['quota_consuming_calls']}",
+            file=sys.stderr,
+        )
+        print(
+            "warning: benchmark requests consume authenticated model quota",
+            file=sys.stderr,
+        )
+        if config.target in {"api", "compare"} and not _base_url_is_loopback(
+            config.base_url
+        ):
+            print(
+                "warning: API benchmark source text will leave this machine",
+                file=sys.stderr,
+            )
+        preflight = _preflight(args, config, cases)
+        if not args.dry_run:
+            asyncio.run(
+                _execute(
+                    args,
+                    config,
+                    cases,
+                    preflight,
+                    samples,
+                    handshakes,
+                )
+            )
+        report = _build_report(
+            args=args,
+            config=config,
+            preflight=preflight,
+            plan=plan,
+            started_at=started_at,
+            started=started,
+            samples=samples,
+            handshakes=handshakes,
+            dry_run=args.dry_run,
+        )
+        rendered = _render(report, args.format)
+        if args.output:
+            _write_output(args.output, rendered, force=args.force)
+            print(f"report written: {Path(args.output).expanduser()}", file=sys.stderr)
+        else:
+            sys.stdout.write(rendered)
+        return 1 if any(not sample.success for sample in samples) else 0
+    except KeyboardInterrupt:
+        if (
+            args.output
+            and config is not None
+            and preflight is not None
+            and plan is not None
+        ):
+            report = _build_report(
+                args=args,
+                config=config,
+                preflight=preflight,
+                plan=plan,
+                started_at=started_at,
+                started=started,
+                samples=samples,
+                handshakes=handshakes,
+                dry_run=False,
+                status_override="interrupted",
+            )
+            try:
+                _write_output(
+                    args.output,
+                    _render(report, args.format),
+                    force=args.force,
+                )
+            except BenchmarkError as exc:
+                print(
+                    f"immerse-bench could not write partial report: {exc}",
+                    file=sys.stderr,
+                )
+        print("immerse-bench interrupted", file=sys.stderr)
+        return 130
+    except BenchmarkError as exc:
+        print(f"immerse-bench failed: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except (OSError, ValueError) as exc:
+        print(f"immerse-bench failed: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

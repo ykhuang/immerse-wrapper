@@ -20,6 +20,10 @@ Actual model availability depends on the authenticated account. Use `agy models`
 - [Quick start](QUICKSTART.md)
 - [User guide](USERGUIDE.md)
 
+Release bundles also include `immerse-bench`, a command-line diagnostic that can
+compare direct Agy/Codex latency with the complete ImmerseWrapper HTTP path. See
+the user guide for quota, privacy, and interpretation notes.
+
 ## Tested on
 
 - WSL2 / Ubuntu
