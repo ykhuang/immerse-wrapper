@@ -10,10 +10,12 @@ The motivation behind ImmerseWrapper is straightforward: Immersive Translate gen
 
 ## Current model baseline
 
-- Antigravity: `gemini-3.6-flash` or newer, with reasoning effort configured separately.
-- Codex: `gpt-5.6-luna` or newer, with reasoning effort configured separately.
+- Antigravity: `gemini-3.8-flash` with reasoning effort configured separately.
+- Codex: `gpt-6-luna` with reasoning effort configured separately.
 
-Actual model availability depends on the authenticated account. Use `agy models` to confirm the available Antigravity model slugs before pinning one.
+Actual model availability depends on the authenticated account and installed CLI
+version. Use `agy models` to confirm Antigravity choices and Codex app-server
+`model/list` (or the Codex model selector) before pinning a model.
 
 ## Documentation
 

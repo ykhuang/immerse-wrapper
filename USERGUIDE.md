@@ -1,7 +1,8 @@
 # ImmerseWrapper 使用指南
 
-適用版本：`0.1.1`  
-最後驗證：2026-08-17（WSL2 Ubuntu 跨機安裝流程）
+適用版本：`0.1.2`
+
+最後驗證：2026-11-19（Agy 1.5.9、Codex CLI 0.170.0）
 
 這份文件提供 wheel 使用者完整的安裝、設定、service 與維護流程。wheel 只包含
 ImmerseWrapper 程式與 Python dependency metadata；Codex／Antigravity CLI、登入狀態、
@@ -35,13 +36,13 @@ codex --version
 進入收到發布檔案的目錄：
 
 ```bash
-sha256sum -c local_cli_translation_adapter-0.1.1-py3-none-any.whl.sha256
+sha256sum -c local_cli_translation_adapter-0.1.2-py3-none-any.whl.sha256
 ```
 
 預期結果：
 
 ```text
-local_cli_translation_adapter-0.1.1-py3-none-any.whl: OK
+local_cli_translation_adapter-0.1.2-py3-none-any.whl: OK
 ```
 
 ## 3. 建立 venv 並安裝
@@ -56,7 +57,7 @@ sudo apt install -y python3-venv
 python3 -m venv ~/.venvs/immerse-wrapper
 ~/.venvs/immerse-wrapper/bin/python -m pip install --upgrade pip
 ~/.venvs/immerse-wrapper/bin/python -m pip install \
-  ./local_cli_translation_adapter-0.1.1-py3-none-any.whl
+  ./local_cli_translation_adapter-0.1.2-py3-none-any.whl
 ```
 
 確認 console command：
@@ -68,7 +69,7 @@ python3 -m venv ~/.venvs/immerse-wrapper
 預期結果：
 
 ```text
-immerse-wrapper 0.1.1
+immerse-wrapper 0.1.2
 ```
 
 不必每次 `source` venv；後續指令可直接使用上面的完整路徑。
@@ -106,7 +107,7 @@ BACKEND_MODE=cli
 DEFAULT_BACKEND=antigravity
 ENABLE_ANTIGRAVITY=true
 ANTIGRAVITY_COMMAND=agy
-ANTIGRAVITY_MODEL=gemini-3.6-flash
+ANTIGRAVITY_MODEL=gemini-3.8-flash
 ANTIGRAVITY_REASONING_EFFORT=low
 ENABLE_CODEX=false
 ENABLE_LEGACY_GEMINI=false
@@ -133,22 +134,22 @@ OBSERVE_REQUEST_SHAPE=false
 YouTube 字幕較重視即時性時，可先把 `BATCH_WINDOW_MS` 改成 `60`；一般網頁建議先從
 `300` 開始。
 
-Agy 1.1.5 以上支援獨立的 reasoning effort。目前文件使用仍可用的最低 Gemini Flash
-系列 `gemini-3.6-flash`；建議把 model 與 effort 分開設定：
+Agy 支援獨立的 reasoning effort。目前文件使用適合低延遲翻譯的
+`gemini-3.8-flash`；建議把 model 與 effort 分開設定：
 
 ```dotenv
-ANTIGRAVITY_MODEL=gemini-3.6-flash
+ANTIGRAVITY_MODEL=gemini-3.8-flash
 ANTIGRAVITY_REASONING_EFFORT=low
 ```
 
 若帳號列出的完整 model slug 已包含 effort，也可以使用完整 slug 並把獨立設定留空：
 
 ```dotenv
-ANTIGRAVITY_MODEL=gemini-3.6-flash-low
+ANTIGRAVITY_MODEL=gemini-3.8-flash-low
 ANTIGRAVITY_REASONING_EFFORT=
 ```
 
-完整 model slug 與獨立 effort 同時設定時必須一致；例如 `gemini-3.6-flash-low` 搭配
+完整 model slug 與獨立 effort 同時設定時必須一致；例如 `gemini-3.8-flash-low` 搭配
 `high` 會在啟動設定驗證時失敗。可用 `agy models` 查詢可用模型，並以
 `agy --model <MODEL> -p '/effort'` 確認解析結果。
 
@@ -175,7 +176,7 @@ DEFAULT_BACKEND=codex
 ENABLE_ANTIGRAVITY=false
 ENABLE_CODEX=true
 CODEX_COMMAND=codex
-CODEX_MODEL=gpt-5.6-luna
+CODEX_MODEL=gpt-6-luna
 CODEX_REASONING_EFFORT=low
 CODEX_TRANSPORT=exec
 CODEX_SANDBOX=read-only
@@ -183,7 +184,7 @@ CODEX_EPHEMERAL=true
 MAX_CONCURRENCY=3
 ```
 
-模型與 reasoning effort 是不同參數；不要把 `gpt-5.6-luna-low` 當成模型名稱。
+模型與 reasoning effort 是不同參數；不要把 `gpt-6-luna-low` 當成模型名稱。
 
 若要使用 persistent app-server，改成：
 
@@ -206,10 +207,10 @@ CODEX_APP_SERVER_FALLBACK_TO_EXEC=true
 | `BACKEND_MODE` | 正式翻譯使用 `cli`；`mock` 只用於協定測試。 |
 | `MAX_CONCURRENCY` | 同時執行的 backend call 數。Agy/Codex exec 可先用 `3`；Codex app-server 必須為 `1`。 |
 | `REQUEST_TIMEOUT_SECONDS` | Adapter 等待 backend 的上限；目前預設 `120` 秒。這不能延長 Immersive Translate 自己的 timeout。 |
-| `ANTIGRAVITY_MODEL` | Agy 模型；目前最低建議為 `gemini-3.6-flash`，留空表示使用 CLI/account 預設值。 |
-| `ANTIGRAVITY_REASONING_EFFORT` | 可選的 Agy reasoning effort：`low`、`medium` 或 `high`。完整 model slug 已含 effort 時可留空。 |
-| `CODEX_MODEL` | Codex 模型 ID，不包含 reasoning effort；目前最低建議為 `gpt-5.6-luna`。 |
-| `CODEX_REASONING_EFFORT` | `minimal`、`low`、`medium`、`high` 或 `xhigh`；翻譯通常先用 `low`。 |
+| `ANTIGRAVITY_MODEL` | Agy 模型；目前低延遲建議為 `gemini-3.8-flash`，留空表示使用 CLI/account 預設值。 |
+| `ANTIGRAVITY_REASONING_EFFORT` | 可選的 Agy reasoning effort：`low`、`medium`、`high`、`xhigh` 或 `max`；實際範圍依模型而定。完整 model slug 已含 effort 時可留空。 |
+| `CODEX_MODEL` | Codex 模型 ID，不包含 reasoning effort；目前低延遲建議為 `gpt-6-luna`。 |
+| `CODEX_REASONING_EFFORT` | 可接受 `minimal`、`low`、`medium`、`high`、`xhigh`、`max` 或 `ultra`；實際範圍依模型而定，翻譯通常先用 `low`。 |
 | `CODEX_TRANSPORT` | `exec` 每次啟動 CLI；`app-server` 使用 persistent transport。 |
 | `ENABLE_MICRO_BATCHING` | `true` 時將相容的短請求合併成較少的 CLI call。 |
 | `BATCH_WINDOW_MS` | 最多等待多久收集 batch；到達 item 上限時會提前送出。 |

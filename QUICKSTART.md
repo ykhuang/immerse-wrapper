@@ -1,6 +1,6 @@
 # ImmerseWrapper Quick Start（Antigravity）
 
-適用版本：`0.1.1`
+適用版本：`0.1.2`
 
 這份文件只提供 Antigravity backend 的最短安裝流程。Codex、進階參數、service lifecycle、
 更新與移除方式請參考 [USERGUIDE.md](USERGUIDE.md)。
@@ -25,7 +25,7 @@ agy --version
 在 Ubuntu 進入發布檔案所在目錄：
 
 ```bash
-sha256sum -c local_cli_translation_adapter-0.1.1-py3-none-any.whl.sha256
+sha256sum -c local_cli_translation_adapter-0.1.2-py3-none-any.whl.sha256
 
 sudo apt update
 sudo apt install -y python3-venv
@@ -33,7 +33,7 @@ sudo apt install -y python3-venv
 python3 -m venv ~/.venvs/immerse-wrapper
 ~/.venvs/immerse-wrapper/bin/python -m pip install --upgrade pip
 ~/.venvs/immerse-wrapper/bin/python -m pip install \
-  ./local_cli_translation_adapter-0.1.1-py3-none-any.whl
+  ./local_cli_translation_adapter-0.1.2-py3-none-any.whl
 ```
 
 ## 3. 設定 Antigravity
@@ -52,7 +52,7 @@ DEFAULT_BACKEND=antigravity
 BACKEND_MODE=cli
 ENABLE_ANTIGRAVITY=true
 ANTIGRAVITY_COMMAND=agy
-ANTIGRAVITY_MODEL=gemini-3.6-flash
+ANTIGRAVITY_MODEL=gemini-3.8-flash
 ANTIGRAVITY_REASONING_EFFORT=low
 ANTIGRAVITY_SANDBOX=true
 ANTIGRAVITY_MODE=plan

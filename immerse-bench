@@ -337,9 +337,20 @@ def _effective_config(args: argparse.Namespace) -> EffectiveConfig:
             else None
         )
     )
-    if agy_effort not in {None, "low", "medium", "high"}:
-        raise ConfigurationError("Antigravity effort must be low, medium, or high")
-    if codex_effort not in {None, "minimal", "low", "medium", "high", "xhigh"}:
+    if agy_effort not in {None, "low", "medium", "high", "xhigh", "max"}:
+        raise ConfigurationError(
+            "Antigravity effort must be low, medium, high, xhigh, or max"
+        )
+    if codex_effort not in {
+        None,
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    }:
         raise ConfigurationError("Codex effort is invalid")
 
     concurrency = (
@@ -1529,10 +1540,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoning-effort")
     parser.add_argument("--antigravity-command")
     parser.add_argument("--antigravity-model")
-    parser.add_argument("--antigravity-reasoning-effort", choices=("low", "medium", "high"))
+    parser.add_argument(
+        "--antigravity-reasoning-effort",
+        choices=("low", "medium", "high", "xhigh", "max"),
+    )
     parser.add_argument("--codex-command")
     parser.add_argument("--codex-model")
-    parser.add_argument("--codex-reasoning-effort", choices=("minimal", "low", "medium", "high", "xhigh"))
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+    )
     parser.add_argument("--codex-transport", choices=("exec", "app-server"))
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
